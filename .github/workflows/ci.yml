@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_ENV: test
+
+jobs:
+  lint:
+    name: Validate code quality using ESLint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18.x
+          cache: npm
+          cache-dependency-path: src/backend/package-lock.json
+      
+      - name: Install dependencies
+        working-directory: src/backend
+        run: npm ci
+      
+      - name: Run linting
+        working-directory: src/backend
+        run: npm run lint
+
+  test:
+    name: Run unit and integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18.x
+          cache: npm
+          cache-dependency-path: src/backend/package-lock.json
+      
+      - name: Install dependencies
+        working-directory: src/backend
+        run: npm ci
+      
+      - name: Run tests with coverage
+        working-directory: src/backend
+        run: npm run test:coverage
+      
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: src/backend/coverage
+          retention-days: 7
+
+  security:
+    name: Run security checks on dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18.x
+          cache: npm
+          cache-dependency-path: src/backend/package-lock.json
+      
+      - name: Install dependencies
+        working-directory: src/backend
+        run: npm ci --production
+      
+      - name: Run security audit
+        working-directory: src/backend
+        run: npm audit
+
+  build:
+    name: Build and package the application
+    runs-on: ubuntu-latest
+    needs: [lint, test, security]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18.x
+          cache: npm
+          cache-dependency-path: src/backend/package-lock.json
+      
+      - name: Install production dependencies
+        working-directory: src/backend
+        run: npm ci --production
+      
+      - name: Create build directory
+        run: mkdir -p build
+      
+      - name: Copy application files
+        run: cp -r src/backend/{*.js,package.json,package-lock.json,node_modules} build/
+      
+      - name: Create build artifact
+        run: tar -czf hello-world-server.tar.gz -C build .
+      
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: hello-world-server
+          path: hello-world-server.tar.gz
+          retention-days: 7
+
+  performance:
+    name: Run performance tests
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18.x
+          cache: npm
+          cache-dependency-path: src/backend/package-lock.json
+      
+      - name: Install dependencies
+        working-directory: src/backend
+        run: npm ci
+      
+      - name: Run performance tests
+        working-directory: src/backend
+        run: npm run perf
