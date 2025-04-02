@@ -1,0 +1,226 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (leave empty to use version from package.json)'
+        required: false
+        default: ''
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      deploy_method:
+        description: 'Deployment method'
+        required: true
+        default: 'docker'
+        type: choice
+        options:
+          - docker
+          - direct
+  push:
+    tags:
+      - 'v*'
+
+env:
+  NODE_ENV: production
+
+permissions:
+  contents: write
+  packages: write
+  deployments: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release information and validate requirements
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18.x'
+          cache: 'npm'
+          cache-dependency-path: 'src/backend/package-lock.json'
+
+      - name: Get version from package.json
+        id: package_version
+        if: ${{ inputs.version == '' }}
+        run: echo "version=$(node -p "require('./src/backend/package.json').version")" >> $GITHUB_OUTPUT
+
+      - name: Set release version
+        id: release_version
+        run: echo "version=${{ inputs.version || steps.package_version.outputs.version }}" >> $GITHUB_OUTPUT
+
+      - name: Validate version format
+        run: echo ${{ steps.release_version.outputs.version }} | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || (echo 'Invalid version format. Must be in format x.y.z' && exit 1)
+
+      - name: Set release tag
+        id: release_tag
+        run: echo "tag=v${{ steps.release_version.outputs.version }}" >> $GITHUB_OUTPUT
+
+      - name: Set application name
+        id: app_name
+        run: echo "name=$(node -p "require('./src/backend/package.json').name")" >> $GITHUB_OUTPUT
+
+    outputs:
+      version: ${{ steps.release_version.outputs.version }}
+      tag: ${{ steps.release_tag.outputs.tag }}
+      app_name: ${{ steps.app_name.outputs.name }}
+
+  build:
+    name: Build and package the application
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18.x'
+          cache: 'npm'
+          cache-dependency-path: 'src/backend/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: src/backend
+        run: npm ci
+
+      - name: Run tests
+        working-directory: src/backend
+        run: npm test
+
+      - name: Create version file
+        working-directory: src/backend
+        run: echo ${{ needs.prepare.outputs.version }} > VERSION
+
+      - name: Install production dependencies
+        working-directory: src/backend
+        run: npm ci --production
+
+      - name: Create build directory
+        run: mkdir -p build
+
+      - name: Copy application files
+        run: cp -r src/backend/{*.js,package.json,package-lock.json,node_modules,VERSION} build/
+
+      - name: Create build artifact
+        run: tar -czf ${{ needs.prepare.outputs.app_name }}-${{ needs.prepare.outputs.version }}.tar.gz -C build .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: app-package
+          path: ${{ needs.prepare.outputs.app_name }}-${{ needs.prepare.outputs.version }}.tar.gz
+          retention-days: 7
+
+  docker_build:
+    name: Build and push Docker image
+    needs: [prepare, build]
+    if: ${{ inputs.deploy_method == 'docker' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: src/backend
+          file: infrastructure/docker/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/${{ needs.prepare.outputs.app_name }}:${{ needs.prepare.outputs.version }},${{ secrets.DOCKER_USERNAME }}/${{ needs.prepare.outputs.app_name }}:latest
+          build-args: VERSION=${{ needs.prepare.outputs.version }}
+
+  create_release:
+    name: Create GitHub release
+    needs: [prepare, build]
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: app-package
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          release_name: Release ${{ needs.prepare.outputs.tag }}
+          draft: false
+          prerelease: ${{ inputs.environment != 'production' }}
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ needs.prepare.outputs.app_name }}-${{ needs.prepare.outputs.version }}.tar.gz
+          asset_name: ${{ needs.prepare.outputs.app_name }}-${{ needs.prepare.outputs.version }}.tar.gz
+          asset_content_type: application/gzip
+
+  deploy:
+    name: Deploy to target environment
+    needs: [prepare, build, docker_build]
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: app-package
+
+      - name: Set up SSH key
+        if: ${{ inputs.environment != 'development' }}
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy to development
+        if: ${{ inputs.environment == 'development' }}
+        run: bash infrastructure/scripts/deploy.sh -e development -v ${{ needs.prepare.outputs.version }} -m ${{ inputs.deploy_method }}
+
+      - name: Deploy to staging
+        if: ${{ inputs.environment == 'staging' }}
+        run: bash infrastructure/scripts/deploy.sh -e staging -v ${{ needs.prepare.outputs.version }} -m ${{ inputs.deploy_method }} -h ${{ secrets.STAGING_HOST }}
+
+      - name: Deploy to production
+        if: ${{ inputs.environment == 'production' }}
+        run: bash infrastructure/scripts/deploy.sh -e production -v ${{ needs.prepare.outputs.version }} -m ${{ inputs.deploy_method }} -h ${{ secrets.PRODUCTION_HOST }}
+
+      - name: Verify deployment
+        run: curl -s -o /dev/null -w '%{http_code}' ${{ secrets.DEPLOY_VERIFY_URL || 'http://localhost:3000/hello' }} | grep 200 || (echo 'Deployment verification failed' && exit 1)
